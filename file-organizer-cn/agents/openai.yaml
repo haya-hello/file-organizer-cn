@@ -1,0 +1,4 @@
+interface:
+  display_name: "文件整理助手"
+  short_description: "先预览再确认，可撤销地整理电脑文件夹，适合中文普通用户首次使用"
+  default_prompt: "请使用 $file-organizer-cn，先预览我的下载文件夹怎么整理，不要移动文件。"

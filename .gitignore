@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.file-organizer-cn/
+已整理/
+.DS_Store
+Thumbs.db
