@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +55,8 @@ class FileOrganizerTests(unittest.TestCase):
         self.assertFalse((self.target / MODULE.STATE_DIR_NAME).exists())
         self.assertEqual(plan["total_files"], 1)
         self.assertEqual(plan["moves"][0]["category"], "文档")
+        self.assertEqual(len(plan["plan_id"]), 16)
+        self.assertEqual(plan["excluded_categories"], ["代码与数据", "其他"])
 
     def test_preview_skips_directories_hidden_temp_and_symlinks(self) -> None:
         self.write_file("普通图片.png")
@@ -79,15 +82,68 @@ class FileOrganizerTests(unittest.TestCase):
 
     def test_organize_requires_confirmation(self) -> None:
         self.write_file("report.pdf")
+        plan = MODULE.build_plan(self.target)
         with self.assertRaises(MODULE.OrganizerError):
-            MODULE.organize(self.target, confirmed=False)
+            MODULE.organize(self.target, confirmed=False, plan_id=plan["plan_id"])
         self.assertTrue((self.target / "report.pdf").exists())
+
+    def test_organize_requires_matching_preview_plan(self) -> None:
+        source = self.write_file("report.pdf", b"v1")
+        plan = MODULE.build_plan(self.target)
+
+        with self.assertRaises(MODULE.OrganizerError):
+            MODULE.organize(self.target, confirmed=True)
+
+        source.write_bytes(b"v2 changed")
+        with self.assertRaises(MODULE.OrganizerError):
+            MODULE.organize(self.target, confirmed=True, plan_id=plan["plan_id"])
+        self.assertTrue(source.exists())
+
+    def test_stale_plan_rejects_destination_created_after_preview(self) -> None:
+        source = self.write_file("海报.png", b"new")
+        plan = MODULE.build_plan(self.target)
+        destination = Path(plan["moves"][0]["destination"])
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"arrived later")
+
+        with self.assertRaises(MODULE.OrganizerError):
+            MODULE.organize(self.target, confirmed=True, plan_id=plan["plan_id"])
+
+        self.assertEqual(source.read_bytes(), b"new")
+        self.assertEqual(destination.read_bytes(), b"arrived later")
+        self.assertFalse((destination.parent / "海报 (1).png").exists())
+
+    def test_execution_race_does_not_change_planned_destination(self) -> None:
+        source = self.write_file("海报.png", b"new")
+        plan = MODULE.build_plan(self.target)
+        destination = Path(plan["moves"][0]["destination"])
+        original_managed_directory = MODULE._managed_directory
+        injected = False
+
+        def create_racing_file(path: Path, target: Path, create: bool):
+            """模拟校验后目标被占用。 / Simulate a destination occupied after validation."""
+            nonlocal injected
+            result = original_managed_directory(path, target, create)
+            if path.name == "图片" and create and not injected:
+                destination.write_bytes(b"arrived during execution")
+                injected = True
+            return result
+
+        with mock.patch.object(MODULE, "_managed_directory", side_effect=create_racing_file):
+            result = MODULE.organize(self.target, confirmed=True, plan_id=plan["plan_id"])
+
+        self.assertEqual(result["moved_count"], 0)
+        self.assertEqual(result["failed_count"], 1)
+        self.assertEqual(source.read_bytes(), b"new")
+        self.assertEqual(destination.read_bytes(), b"arrived during execution")
+        self.assertFalse((destination.parent / "海报 (1).png").exists())
 
     def test_organize_renames_conflicts_and_writes_manifest(self) -> None:
         self.write_file("照片.jpg", b"new")
         existing = self.write_file("已整理/图片/照片.jpg", b"existing")
+        plan = MODULE.build_plan(self.target)
 
-        result = MODULE.organize(self.target, confirmed=True)
+        result = MODULE.organize(self.target, confirmed=True, plan_id=plan["plan_id"])
 
         self.assertEqual(result["moved_count"], 1)
         self.assertEqual(existing.read_bytes(), b"existing")
@@ -101,7 +157,8 @@ class FileOrganizerTests(unittest.TestCase):
 
     def test_undo_restores_latest_run(self) -> None:
         original = self.write_file("作业.pdf", b"homework")
-        organize_result = MODULE.organize(self.target, confirmed=True)
+        plan = MODULE.build_plan(self.target)
+        organize_result = MODULE.organize(self.target, confirmed=True, plan_id=plan["plan_id"])
         moved = self.target / "已整理" / "PDF" / "作业.pdf"
         self.assertFalse(original.exists())
         self.assertTrue(moved.exists())
@@ -116,7 +173,8 @@ class FileOrganizerTests(unittest.TestCase):
 
     def test_undo_never_overwrites_new_file(self) -> None:
         original = self.write_file("总结.txt", b"old")
-        MODULE.organize(self.target, confirmed=True)
+        plan = MODULE.build_plan(self.target)
+        MODULE.organize(self.target, confirmed=True, plan_id=plan["plan_id"])
         original.write_bytes(b"new")
 
         result = MODULE.undo(self.target, confirmed=True)
@@ -161,8 +219,42 @@ class FileOrganizerTests(unittest.TestCase):
             self.skipTest("当前系统不允许创建目录符号链接")
 
         with self.assertRaises(MODULE.OrganizerError):
-            MODULE.organize(self.target, confirmed=True)
+            plan = MODULE.build_plan(self.target)
+            MODULE.organize(self.target, confirmed=True, plan_id=plan["plan_id"])
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_safe_mode_skips_code_and_unknown_files(self) -> None:
+        self.write_file("文案.docx")
+        self.write_file("脚本.py")
+        self.write_file("模型.unknown")
+
+        safe_plan = MODULE.build_plan(self.target)
+        self.assertEqual([Path(item["source"]).name for item in safe_plan["moves"]], ["文案.docx"])
+        skipped = {Path(item["path"]).name: item["reason"] for item in safe_plan["skipped"]}
+        self.assertEqual(skipped["脚本.py"], "安全模式排除分类：代码与数据")
+        self.assertEqual(skipped["模型.unknown"], "安全模式排除分类：其他")
+
+        all_categories = MODULE.normalize_excluded_categories([], include_risky=True)
+        full_plan = MODULE.build_plan(self.target, all_categories)
+        self.assertEqual(full_plan["total_files"], 3)
+
+    def test_html_report_hides_names_and_never_overwrites(self) -> None:
+        self.write_file("客户名单.xlsx", b"private")
+        report_path = Path(self.temporary.name) / "preview.html"
+        plan = MODULE.build_plan(self.target)
+
+        created = MODULE.render_report(plan, report_path, reveal_names=False)
+        report = created.read_text(encoding="utf-8")
+        self.assertIn(plan["plan_id"], report)
+        self.assertIn("已隐藏文件名 .xlsx", report)
+        self.assertNotIn("客户名单", report)
+        self.assertNotIn(str(self.target), report)
+
+        with self.assertRaises(MODULE.OrganizerError):
+            MODULE.render_report(plan, report_path, reveal_names=False)
+
+        with self.assertRaises(MODULE.OrganizerError):
+            MODULE.render_report(plan, self.target / "整理报告.html", reveal_names=False)
 
     def test_cli_preview_organize_history_and_undo(self) -> None:
         source = self.write_file("口播脚本.txt", b"script")
@@ -174,13 +266,30 @@ class FileOrganizerTests(unittest.TestCase):
             text=True,
             encoding="utf-8",
         )
-        self.assertEqual(json.loads(preview.stdout)["total_files"], 1)
+        preview_payload = json.loads(preview.stdout)
+        self.assertEqual(preview_payload["total_files"], 1)
         self.assertTrue(source.exists())
+
+        report_path = Path(self.temporary.name) / "cli-preview.html"
+        report = subprocess.run(
+            [
+                sys.executable, "-X", "utf8", str(SCRIPT), "report", str(self.target),
+                "--output", str(report_path), "--json",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        report_payload = json.loads(report.stdout)
+        self.assertEqual(report_payload["plan_id"], preview_payload["plan_id"])
+        self.assertTrue(report_path.exists())
+        self.assertNotIn("口播脚本", report_path.read_text(encoding="utf-8"))
 
         execute = subprocess.run(
             [
                 sys.executable, "-X", "utf8", str(SCRIPT), "organize", str(self.target),
-                "--confirm", "--json",
+                "--confirm", "--plan-id", preview_payload["plan_id"], "--json",
             ],
             check=True,
             capture_output=True,

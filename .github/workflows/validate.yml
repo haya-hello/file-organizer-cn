@@ -19,3 +19,14 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Validate Skill package
         run: python tests/validate_skill.py
+      - name: Verify public example contains no local path
+        shell: bash
+        run: |
+          if grep -Fq 'D:\自媒体项目' examples/file-organizer-preview.html; then
+            echo 'Public example leaked a local path'
+            exit 1
+          fi
+          if grep -Fq '活动方案' examples/file-organizer-preview.html; then
+            echo 'Public example leaked a demo filename in privacy mode'
+            exit 1
+          fi

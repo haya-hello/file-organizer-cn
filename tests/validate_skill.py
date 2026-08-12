@@ -45,7 +45,10 @@ def main() -> int:
     if script_path.is_file():
         source = script_path.read_text(encoding="utf-8")
         compile(source, str(script_path), "exec")
-        for required_text in ("--confirm", "preview", "undo", "overwrites_files"):
+        for required_text in (
+            "--confirm", "--plan-id", "preview", "report", "undo",
+            "overwrites_files", "DEFAULT_EXCLUDED_CATEGORIES",
+        ):
             if required_text not in source:
                 errors.append(f"脚本缺少安全能力标记：{required_text}")
 

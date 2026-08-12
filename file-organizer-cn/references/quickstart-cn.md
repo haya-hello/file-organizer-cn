@@ -36,6 +36,20 @@ python ".\file-organizer-cn\scripts\file_organizer.py" preview "downloads"
 
 macOS / Linux 将 `python` 换成 `python3` 即可。
 
+预览会返回一个计划编号。正式执行时必须使用该编号，例如：
+
+```powershell
+python ".\file-organizer-cn\scripts\file_organizer.py" organize "downloads" --confirm --plan-id "a1b2c3d4e5f67890"
+```
+
+希望先看图形化结果时：
+
+```powershell
+python ".\file-organizer-cn\scripts\file_organizer.py" report "downloads" --output ".\整理预览.html"
+```
+
+报告默认隐藏文件名和完整路径，适合确认方案或对外截图。
+
 ## 常见问题
 
 ### 找不到 Python
@@ -55,6 +69,14 @@ python ".\file-organizer-cn\scripts\file_organizer.py" preview "D:\Downloads"
 ### 为什么只预览，没有直接整理
 
 这是强制安全设计。用户必须先看到将移动什么，再明确确认。正式命令还必须包含 `--confirm`。
+
+### 为什么代码和一部分文件没有被整理
+
+代码、数据文件和无法识别类型的文件，误移动风险更高，所以默认跳过。确实需要整理时，重新预览并添加 `--include-risky`，正式执行时也必须使用相同选项。
+
+### 为什么确认后仍然拒绝执行
+
+预览后目标文件夹发生了变化，旧计划已经不再准确。重新预览并使用新的计划编号即可。
 
 ### 为什么没有整理子文件夹
 

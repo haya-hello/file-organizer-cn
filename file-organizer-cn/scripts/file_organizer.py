@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import html
 import json
 import os
 import shutil
@@ -15,7 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 STATE_DIR_NAME = ".file-organizer-cn"
 OUTPUT_DIR_NAME = "已整理"
 
@@ -54,6 +56,7 @@ PROJECT_MARKERS = {
 PROJECT_DIR_MARKERS = {"src", "app", "lib", "packages"}
 VCS_MARKERS = {".git", ".hg", ".svn"}
 UNDOABLE_STATES = {"moved", "undo_conflict", "undo_error", "undo_missing"}
+DEFAULT_EXCLUDED_CATEGORIES = {"代码与数据", "其他"}
 
 
 class OrganizerError(RuntimeError):
@@ -82,6 +85,26 @@ def classify_file(path: Path) -> str:
         if suffix in extensions:
             return category
     return "其他"
+
+
+def normalize_excluded_categories(
+    values: Optional[Iterable[str]] = None,
+    include_risky: bool = False,
+) -> set[str]:
+    """规范化排除分类。 / Normalize excluded category names."""
+    excluded = set() if include_risky else set(DEFAULT_EXCLUDED_CATEGORIES)
+    for value in values or []:
+        for name in value.replace("，", ",").split(","):
+            normalized = name.strip()
+            if normalized:
+                excluded.add(normalized)
+    valid_categories = set(CATEGORIES) | {"其他"}
+    unknown = sorted(excluded - valid_categories)
+    if unknown:
+        raise OrganizerError(
+            "未知分类：" + "、".join(unknown) + "。可用分类：" + "、".join(sorted(valid_categories))
+        )
+    return excluded
 
 
 def _alias_candidates(alias: str) -> list[Path]:
@@ -240,9 +263,39 @@ def unique_destination(directory: Path, filename: str, reserved: set[str]) -> Pa
     return candidate
 
 
-def build_plan(target: Path) -> dict[str, Any]:
+def _file_fingerprint(path: Path) -> dict[str, int]:
+    """读取用于计划校验的轻量指纹。 / Read a lightweight fingerprint for plan verification."""
+    metadata = path.lstat()
+    return {"size_bytes": metadata.st_size, "modified_ns": metadata.st_mtime_ns}
+
+
+def _plan_id(target: Path, moves: list[dict[str, Any]], excluded_categories: set[str]) -> str:
+    """生成稳定且不可猜测内容变化的计划编号。 / Build a stable content-sensitive plan ID."""
+    canonical = {
+        "target": str(target),
+        "excluded_categories": sorted(excluded_categories),
+        "moves": [
+            {
+                "source": item["source"],
+                "destination": item["destination"],
+                "category": item["category"],
+                "size_bytes": item["size_bytes"],
+                "modified_ns": item["modified_ns"],
+            }
+            for item in moves
+        ],
+    }
+    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def build_plan(
+    target: Path,
+    excluded_categories: Optional[set[str]] = None,
+) -> dict[str, Any]:
     """构建只读整理计划。 / Build a read-only organization plan."""
     validate_target(target)
+    excluded = set(DEFAULT_EXCLUDED_CATEGORIES) if excluded_categories is None else set(excluded_categories)
     output_root = target / OUTPUT_DIR_NAME
     reserved: set[str] = set()
     moves: list[dict[str, Any]] = []
@@ -261,17 +314,20 @@ def build_plan(target: Path) -> dict[str, Any]:
             skipped.append({"path": str(entry), "reason": reason})
             continue
         category = classify_file(entry)
-        destination = unique_destination(output_root / category, entry.name, reserved)
+        if category in excluded:
+            skipped.append({"path": str(entry), "reason": f"安全模式排除分类：{category}"})
+            continue
         try:
-            size_bytes = entry.lstat().st_size
+            fingerprint = _file_fingerprint(entry)
         except OSError as exc:
             skipped.append({"path": str(entry), "reason": f"无法读取文件信息：{exc}"})
             continue
+        destination = unique_destination(output_root / category, entry.name, reserved)
         moves.append({
             "source": str(entry),
             "destination": str(destination),
             "category": category,
-            "size_bytes": size_bytes,
+            **fingerprint,
         })
 
     category_data: dict[str, dict[str, int]] = defaultdict(lambda: {"count": 0, "size_bytes": 0})
@@ -279,10 +335,13 @@ def build_plan(target: Path) -> dict[str, Any]:
         category_data[move["category"]]["count"] += 1
         category_data[move["category"]]["size_bytes"] += move["size_bytes"]
 
+    plan_id = _plan_id(target, moves, excluded)
     return {
         "action": "preview",
+        "plan_id": plan_id,
         "target": str(target),
         "output_root": str(output_root),
+        "excluded_categories": sorted(excluded),
         "total_files": len(moves),
         "total_size_bytes": sum(move["size_bytes"] for move in moves),
         "categories": dict(sorted(category_data.items())),
@@ -293,6 +352,7 @@ def build_plan(target: Path) -> dict[str, Any]:
             "deletes_files": False,
             "overwrites_files": False,
             "confirmation_required": True,
+            "plan_locked": True,
         },
     }
 
@@ -331,12 +391,24 @@ def _manifest_path(target: Path) -> Path:
     return history_dir / f"{stamp}.json"
 
 
-def organize(target: Path, confirmed: bool) -> dict[str, Any]:
+def organize(
+    target: Path,
+    confirmed: bool,
+    plan_id: Optional[str] = None,
+    excluded_categories: Optional[set[str]] = None,
+) -> dict[str, Any]:
     """执行带记录的整理。 / Execute a journaled organization run."""
     if not confirmed:
         raise OrganizerError("正式整理必须显式添加 --confirm；请先运行 preview 并让用户确认方案。")
+    if not plan_id:
+        raise OrganizerError("正式整理必须提供预览返回的 --plan-id，不能跳过方案一致性校验。")
 
-    plan = build_plan(target)
+    plan = build_plan(target, excluded_categories)
+    if plan["plan_id"] != plan_id:
+        raise OrganizerError(
+            "文件夹内容或整理选项已变化，当前计划编号与预览不一致。"
+            f"请重新预览并使用新的计划编号：{plan['plan_id']}"
+        )
     if not plan["moves"]:
         return {
             **plan,
@@ -357,24 +429,35 @@ def organize(target: Path, confirmed: bool) -> dict[str, Any]:
         "status": "in_progress",
         "target": str(target),
         "output_root": plan["output_root"],
+        "plan_id": plan["plan_id"],
+        "excluded_categories": plan["excluded_categories"],
         "moves": [{**move, "state": "planned", "error": None} for move in plan["moves"]],
     }
     _atomic_write_json(manifest_path, manifest)
 
     moved_count = 0
     failures: list[dict[str, str]] = []
-    reserved: set[str] = set()
     for item in manifest["moves"]:
         source = Path(item["source"])
         planned_destination = Path(item["destination"])
         try:
             if not source.exists() or not source.is_file() or source.is_symlink():
                 raise OrganizerError("源文件已不存在、不是普通文件或已变成符号链接")
+            fingerprint = _file_fingerprint(source)
+            if (
+                fingerprint["size_bytes"] != item["size_bytes"]
+                or fingerprint["modified_ns"] != item["modified_ns"]
+            ):
+                raise OrganizerError("源文件在预览后发生变化，未移动")
             output_root = _managed_directory(target / OUTPUT_DIR_NAME, target, create=True)
             assert output_root is not None
             category_dir = _managed_directory(output_root / item["category"], target, create=True)
             assert category_dir is not None
-            destination = unique_destination(category_dir, planned_destination.name, reserved)
+            destination = planned_destination
+            if destination.parent.resolve() != category_dir:
+                raise OrganizerError("计划目标目录与当前分类目录不一致，未移动")
+            if destination.exists() or destination.is_symlink():
+                raise OrganizerError("预览后的目标位置已被占用，未覆盖也未改名")
             shutil.move(str(source), str(destination))
             item["destination"] = str(destination)
             item["state"] = "moved"
@@ -394,6 +477,7 @@ def organize(target: Path, confirmed: bool) -> dict[str, Any]:
         "status": manifest["status"],
         "target": str(target),
         "output_root": plan["output_root"],
+        "plan_id": plan["plan_id"],
         "moved_count": moved_count,
         "failed_count": len(failures),
         "failures": failures,
@@ -576,6 +660,157 @@ def find_large_files(target: Path, min_size_mb: float, limit: int) -> dict[str, 
     }
 
 
+def _display_name(path_value: str, reveal_names: bool) -> str:
+    """为报告生成隐私友好的文件标签。 / Build a privacy-friendly file label for reports."""
+    path = Path(path_value)
+    if reveal_names:
+        return path.name
+    suffix = path.suffix.lower() or "无扩展名"
+    return f"已隐藏文件名 {suffix}"
+
+
+def render_report(plan: dict[str, Any], output_path: Path, reveal_names: bool = False) -> Path:
+    """生成完全离线的预览报告。 / Render a fully offline preview report."""
+    validate_target(Path(plan["target"]))
+    raw_output_path = output_path.expanduser()
+    if raw_output_path.is_symlink():
+        raise OrganizerError(f"报告输出路径不能是符号链接：{raw_output_path}")
+    output_path = raw_output_path.resolve()
+    if output_path.exists():
+        raise OrganizerError(f"报告输出路径已经存在，未覆盖：{output_path}")
+    target = Path(plan["target"]).resolve()
+    if _is_relative_to(output_path, target):
+        raise OrganizerError("报告必须保存在待整理文件夹之外，避免报告本身改变整理计划。")
+
+    max_count = max((data["count"] for data in plan["categories"].values()), default=1)
+    category_cards: list[str] = []
+    for category, data in plan["categories"].items():
+        width = max(8, round(data["count"] / max_count * 100))
+        category_cards.append(
+            "<div class='category'>"
+            f"<div class='category-head'><strong>{html.escape(category)}</strong>"
+            f"<span>{data['count']} 个 · {html.escape(format_size(data['size_bytes']))}</span></div>"
+            f"<div class='track'><div class='bar' style='width:{width}%'></div></div>"
+            "</div>"
+        )
+
+    move_rows: list[str] = []
+    for item in plan["moves"][:12]:
+        label = _display_name(item["source"], reveal_names)
+        move_rows.append(
+            "<tr>"
+            f"<td>{html.escape(label)}</td>"
+            f"<td>{html.escape(item['category'])}</td>"
+            f"<td>{html.escape(format_size(item['size_bytes']))}</td>"
+            "</tr>"
+        )
+
+    skip_counts = Counter(item["reason"] for item in plan["skipped"])
+    skipped_items = "".join(
+        f"<li><span>{html.escape(reason)}</span><strong>{count}</strong></li>"
+        for reason, count in sorted(skip_counts.items())
+    ) or "<li><span>没有跳过项目</span><strong>0</strong></li>"
+
+    excluded_text = "、".join(plan["excluded_categories"]) or "无"
+    privacy_text = "已隐藏完整路径和文件名" if not reveal_names else "已显示文件名，未显示完整路径"
+    document = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>文件整理预览</title>
+  <style>
+    :root {{ color-scheme: light; --ink:#172033; --muted:#667085; --line:#e7eaf0; --blue:#246bfd; --cyan:#2cbcc3; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; background:#f4f6fa; color:var(--ink); font-family:"Microsoft YaHei","PingFang SC",Arial,sans-serif; }}
+    main {{ width:min(980px,calc(100% - 32px)); margin:32px auto; }}
+    .hero {{ padding:34px; border-radius:26px; color:white; background:linear-gradient(130deg,#172b55 0%,#245edb 58%,#2cbcc3 100%); box-shadow:0 20px 55px rgba(33,70,143,.18); }}
+    .eyebrow {{ font-size:13px; letter-spacing:.16em; opacity:.76; }}
+    h1 {{ margin:10px 0 8px; font-size:38px; line-height:1.2; }}
+    .hero p {{ margin:0; opacity:.84; }}
+    .stats {{ display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:28px; }}
+    .stat {{ padding:18px; border:1px solid rgba(255,255,255,.22); border-radius:18px; background:rgba(255,255,255,.1); }}
+    .stat strong {{ display:block; font-size:28px; }}
+    .stat span {{ font-size:13px; opacity:.76; }}
+    .grid {{ display:grid; grid-template-columns:1.2fr .8fr; gap:18px; margin-top:18px; }}
+    section {{ padding:26px; border:1px solid var(--line); border-radius:22px; background:white; box-shadow:0 8px 24px rgba(16,24,40,.04); }}
+    section h2 {{ margin:0 0 18px; font-size:20px; }}
+    .category {{ margin:0 0 15px; }}
+    .category-head {{ display:flex; justify-content:space-between; gap:12px; margin-bottom:7px; font-size:14px; }}
+    .category-head span {{ color:var(--muted); }}
+    .track {{ height:8px; overflow:hidden; border-radius:999px; background:#eef2f7; }}
+    .bar {{ height:100%; border-radius:inherit; background:linear-gradient(90deg,var(--blue),var(--cyan)); }}
+    ul {{ margin:0; padding:0; list-style:none; }}
+    li {{ display:flex; justify-content:space-between; gap:16px; padding:12px 0; border-bottom:1px solid var(--line); font-size:14px; }}
+    li:last-child {{ border-bottom:0; }}
+    table {{ width:100%; border-collapse:collapse; font-size:14px; }}
+    th,td {{ padding:12px 10px; border-bottom:1px solid var(--line); text-align:left; }}
+    th {{ color:var(--muted); font-weight:600; }}
+    .notice {{ margin-top:18px; padding:18px 20px; border-radius:16px; background:#eef4ff; color:#264b92; line-height:1.7; }}
+    .footer {{ margin:18px 2px; color:var(--muted); font-size:12px; line-height:1.7; }}
+    code {{ padding:2px 6px; border-radius:6px; background:#eef1f5; color:#30405f; }}
+    @media(max-width:760px) {{ .grid,.stats {{ grid-template-columns:1fr; }} h1 {{ font-size:30px; }} .hero {{ padding:26px; }} }}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="hero">
+      <div class="eyebrow">FILE ORGANIZER CN · PREVIEW</div>
+      <h1>文件整理预览</h1>
+      <p>先看清楚，再决定是否执行。当前报告没有移动或删除任何文件。</p>
+      <div class="stats">
+        <div class="stat"><strong>{plan['total_files']}</strong><span>计划移动文件</span></div>
+        <div class="stat"><strong>{html.escape(format_size(plan['total_size_bytes']))}</strong><span>计划整理体积</span></div>
+        <div class="stat"><strong>{len(plan['skipped'])}</strong><span>安全跳过项目</span></div>
+      </div>
+    </div>
+    <div class="grid">
+      <section><h2>分类去向</h2>{''.join(category_cards) or '<p>没有可移动文件。</p>'}</section>
+      <section><h2>跳过原因</h2><ul>{skipped_items}</ul></section>
+    </div>
+    <section style="margin-top:18px">
+      <h2>移动示例</h2>
+      <table><thead><tr><th>文件</th><th>目标分类</th><th>大小</th></tr></thead><tbody>{''.join(move_rows) or '<tr><td colspan="3">没有可移动文件</td></tr>'}</tbody></table>
+      <div class="notice">计划编号：<code>{html.escape(plan['plan_id'])}</code><br>默认排除分类：{html.escape(excluded_text)}<br>隐私模式：{html.escape(privacy_text)}</div>
+    </section>
+    <div class="footer">由 file-organizer-cn {VERSION} 离线生成。报告不加载网络资源；如需执行，必须使用与本报告一致的计划编号。</div>
+  </main>
+</body>
+</html>
+"""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(document, encoding="utf-8")
+    return output_path
+
+
+def build_report(
+    target: Path,
+    output_arg: Optional[str],
+    excluded_categories: set[str],
+    reveal_names: bool,
+) -> dict[str, Any]:
+    """生成预览及其可视化报告。 / Build a preview and its visual report."""
+    plan = build_plan(target, excluded_categories)
+    output_path = (
+        Path(output_arg).expanduser()
+        if output_arg
+        else Path.cwd() / f"file-organizer-preview-{plan['plan_id']}.html"
+    )
+    report_path = render_report(plan, output_path, reveal_names)
+    return {
+        "action": "report",
+        "target": str(target),
+        "plan_id": plan["plan_id"],
+        "report": str(report_path),
+        "total_files": plan["total_files"],
+        "total_size_bytes": plan["total_size_bytes"],
+        "excluded_categories": plan["excluded_categories"],
+        "privacy": "names_visible" if reveal_names else "names_hidden",
+        "source_files_untouched": True,
+        "report_written": True,
+    }
+
+
 def _print_categories(categories: dict[str, dict[str, int]]) -> None:
     """打印分类摘要。 / Print a category summary."""
     for category, data in categories.items():
@@ -587,7 +822,10 @@ def print_human(result: dict[str, Any]) -> None:
     action = result["action"]
     if action == "preview":
         print(f"目标：{result['target']}")
+        print(f"计划编号：{result['plan_id']}")
         print(f"计划移动：{result['total_files']} 个文件，共 {format_size(result['total_size_bytes'])}")
+        if result["excluded_categories"]:
+            print(f"安全模式排除：{'、'.join(result['excluded_categories'])}")
         _print_categories(result["categories"])
         if result["moves"]:
             print("移动示例：")
@@ -621,6 +859,26 @@ def print_human(result: dict[str, Any]) -> None:
         for item in result["files"]:
             print(f"  {format_size(item['size_bytes']):>10}  {item['path']}")
         print("这是只读结果，没有移动或删除任何文件。")
+    elif action == "report":
+        print(f"预览报告：{result['report']}")
+        print(f"计划编号：{result['plan_id']}")
+        print(f"隐私模式：{result['privacy']}")
+        print("报告已经生成，但没有移动或删除任何文件。")
+
+
+def _add_category_options(parser: argparse.ArgumentParser) -> None:
+    """添加分类安全选项。 / Add category safety options."""
+    parser.add_argument(
+        "--exclude-category",
+        action="append",
+        default=[],
+        help="额外跳过某分类，可重复或用逗号分隔",
+    )
+    parser.add_argument(
+        "--include-risky",
+        action="store_true",
+        help="同时整理默认跳过的“代码与数据”和“其他”分类",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -634,11 +892,21 @@ def build_parser() -> argparse.ArgumentParser:
     preview_parser = subparsers.add_parser("preview", help="预览分类方案，不写入磁盘")
     preview_parser.add_argument("target", nargs="?", default="downloads", help="目录别名或路径")
     preview_parser.add_argument("--json", action="store_true", help="输出 JSON")
+    _add_category_options(preview_parser)
 
     organize_parser = subparsers.add_parser("organize", help="经明确确认后执行整理")
     organize_parser.add_argument("target", nargs="?", default="downloads", help="目录别名或路径")
     organize_parser.add_argument("--confirm", action="store_true", help="确认已查看预览并执行")
+    organize_parser.add_argument("--plan-id", help="必须使用刚才预览返回的计划编号")
     organize_parser.add_argument("--json", action="store_true", help="输出 JSON")
+    _add_category_options(organize_parser)
+
+    report_parser = subparsers.add_parser("report", help="生成离线可视化预览报告")
+    report_parser.add_argument("target", nargs="?", default="downloads", help="目录别名或路径")
+    report_parser.add_argument("--output", help="HTML 报告输出路径")
+    report_parser.add_argument("--reveal-names", action="store_true", help="在报告中显示文件名")
+    report_parser.add_argument("--json", action="store_true", help="输出 JSON")
+    _add_category_options(report_parser)
 
     history_parser = subparsers.add_parser("history", help="查看整理历史")
     history_parser.add_argument("target", nargs="?", default="downloads", help="目录别名或路径")
@@ -668,9 +936,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         target = resolve_target(args.target)
         if args.command == "preview":
-            result = build_plan(target)
+            excluded = normalize_excluded_categories(args.exclude_category, args.include_risky)
+            result = build_plan(target, excluded)
         elif args.command == "organize":
-            result = organize(target, args.confirm)
+            excluded = normalize_excluded_categories(args.exclude_category, args.include_risky)
+            result = organize(target, args.confirm, args.plan_id, excluded)
+        elif args.command == "report":
+            excluded = normalize_excluded_categories(args.exclude_category, args.include_risky)
+            result = build_report(target, args.output, excluded, args.reveal_names)
         elif args.command == "history":
             result = list_history(target, args.limit)
         elif args.command == "undo":
